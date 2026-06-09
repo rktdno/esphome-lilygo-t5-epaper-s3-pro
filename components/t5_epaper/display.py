@@ -6,6 +6,7 @@ from esphome.const import CONF_ID, CONF_LAMBDA
 
 DEPENDENCIES = ["esp32"]
 CONF_ON_TOUCH = "on_touch"
+CONF_ON_HOME_BUTTON = "on_home_button"
 CONF_VCOM = "vcom"
 CONF_PANEL_ROTATION = "panel_rotation"
 CONF_DEFAULT_CHARGE_CAP = "default_charge_cap"
@@ -34,6 +35,9 @@ CONFIG_SCHEMA = display.FULL_DISPLAY_SCHEMA.extend(
     {
         cv.GenerateID(): cv.declare_id(T5Display),
         cv.Optional(CONF_ON_TOUCH): automation.validate_automation(single=True),
+        # The round "home" key below the screen (a GT911 capacitive key). Wire it to
+        # e.g. lambda: 'id(epd).deep_clean();' for a hardware screen-clean button.
+        cv.Optional(CONF_ON_HOME_BUTTON): automation.validate_automation(single=True),
         # VCOM in millivolts (positive). The correct value is printed on your panel's flex
         # cable; 1560 is a sane default for the T5 S3 Pro's ED047TC1.
         cv.Optional(CONF_VCOM, default=1560): cv.int_range(min=1000, max=2500),
@@ -68,4 +72,10 @@ async def to_code(config):
             var.get_touch_trigger(),
             [(cg.int_, "x"), (cg.int_, "y")],
             config[CONF_ON_TOUCH],
+        )
+    if CONF_ON_HOME_BUTTON in config:
+        await automation.build_automation(
+            var.get_home_button_trigger(),
+            [],
+            config[CONF_ON_HOME_BUTTON],
         )

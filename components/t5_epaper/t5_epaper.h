@@ -184,8 +184,17 @@ class T5Display : public display::Display {
     if (!this->gt911_read_(0x814E, &status, 1))
       return;
     bool touching = false;
-    if (status & 0x80) {  // touch data ready
+    if (status & 0x80) {  // data ready (touch and/or capacitive key)
       uint8_t n = status & 0x0F;
+      // The round "home" button below the screen is a GT911 CAPACITIVE KEY: a press sets status bit4
+      // (HaveKey) with 0 touch points (status=0x90), distinct from a screen tap (bit7 + a touch count,
+      // never bit4). Fire the on_home_button: automation. Debounced — one press yields several reads and
+      // any wired action (e.g. deep_clean) is slow, so coalesce to one fire per second.
+      if ((status & 0x10) && (now - this->last_home_btn_ms_) >= 1000) {
+        this->last_home_btn_ms_ = now;
+        ESP_LOGI("t5_epaper", "home button (GT911 key)");
+        this->home_button_trigger_.trigger();
+      }
       if (n >= 1 && n <= 5) {
         uint8_t pt[8];
         if (this->gt911_read_(0x8150, pt, 8)) {
@@ -219,13 +228,17 @@ class T5Display : public display::Display {
   }
 
   Trigger<int, int> *get_touch_trigger() { return &this->touch_trigger_; }
+  Trigger<> *get_home_button_trigger() { return &this->home_button_trigger_; }
 
-  // De-ghost + full repaint. Wire to an HA button/service, or to a binary_sensor for a physical button.
-  // E-paper ghosting only clears by flashing every pixel through the waveform, which the diff engine
-  // won't do on its own. This does it SAFELY: (1) render the current view FIRST and ABORT if it's blank,
-  // so we never flash the panel white with nothing to put back; (2) drive the de-ghost through the diff
-  // engine (epd_hl_set_all_white -> push), NEVER the low-level epd_clear() which desyncs the diff and can
-  // strand the panel white. Two passes: pass 1 whitens every non-white pixel, pass 2 redraws the content.
+  // De-ghost + full repaint. Wire to on_home_button:, an HA button/service, or a binary_sensor.
+  // E-paper ghosting only clears by flashing every pixel through the GC16 waveform, which the diff engine
+  // won't do on its own. Done SAFELY: (1) render the current view FIRST and ABORT if blank, so we never
+  // flash the panel with nothing to put back; (2) drive every flash THROUGH the diff engine (NEVER the
+  // low-level epd_clear() which desyncs the diff and strands the panel white). On charger: several full-
+  // screen black<->white GC16 flashes (the solid rail makes the sustained current safe) = a real de-ghost,
+  // ~3s of visible flashing, then repaint. Off charger a GC16 flash can sag the rail mid-waveform (the
+  // white-screen condition), so it falls back to a single light DU pass — that resyncs but can't truly
+  // de-ghost; dock on the charger for a proper clean.
   void deep_clean() {
     this->refresh_battery_();   // refresh charger state NOW so a clean right after docking picks the right path
     this->fb_ = epd_hl_get_framebuffer(&this->hl_);
@@ -236,23 +249,33 @@ class T5Display : public display::Display {
       if (this->fb_[i] != 0xFF) { blank = false; break; }
     if (blank) {
       this->blank_frame_count_++;
-      ESP_LOGW("t5_epaper", "deep_clean aborted - render is blank, not flashing white");
+      ESP_LOGW("t5_epaper", "deep_clean aborted - render is blank, not flashing");
       return;
     }
+    // One full-screen powered push of a SOLID fill (0xFF white / 0x00 black) through the diff engine.
+    auto flash = [&](uint8_t fill, enum EpdDrawMode mode) {
+      this->fb_ = epd_hl_get_framebuffer(&this->hl_);
+      std::memset(this->fb_, fill, this->fb_size_);
+      epd_poweron();
+      if (this->epd_powergood_()) epd_hl_update_screen(&this->hl_, mode, 25);
+      epd_poweroff();
+      this->last_loop_ms_ = millis();   // each push ~0.4s; keep the stall-wdt fed across the sequence
+    };
+    if (this->on_charger_) {
+      for (int i = 0; i < 3; i++) { flash(0x00, MODE_GC16); flash(0xFF, MODE_GC16); }   // black<->white de-ghost
+    } else {
+      flash(0xFF, MODE_DU);                                                              // light resync only
+    }
+    // Redraw content: the flashes left the panel white, so diff(content vs white) = a full repaint.
     enum EpdDrawMode mode = this->on_charger_ ? MODE_GC16 : MODE_DU;
-    // PASS 1 — drive the whole panel white (de-ghost every non-white pixel) and sync back_fb to white
-    epd_hl_set_all_white(&this->hl_);
-    epd_poweron();
-    if (this->epd_powergood_()) epd_hl_update_screen(&this->hl_, mode, 25);
-    epd_poweroff();
-    // PASS 2 — pass 1 wiped the FRONT fb to white, so redraw the content; diff(content vs white) = full repaint
     this->fb_ = epd_hl_get_framebuffer(&this->hl_);
     std::memset(this->fb_, 0xFF, this->fb_size_);
     this->do_update_();
     epd_poweron();
     if (this->epd_powergood_()) epd_hl_update_screen(&this->hl_, mode, 25);
     epd_poweroff();
-    ESP_LOGI("t5_epaper", "deep clean done (%s, 2-pass)", this->on_charger_ ? "GC16" : "DU");
+    this->last_loop_ms_ = millis();
+    ESP_LOGI("t5_epaper", "deep clean (%s)", this->on_charger_ ? "GC16 de-ghost x3" : "DU light, off charger");
   }
 
   // watchdog control — OTA legitimately blocks the loop, so pause around it
@@ -409,6 +432,8 @@ class T5Display : public display::Display {
   bool was_touching_{false};
   int refresh_count_{0};
   Trigger<int, int> touch_trigger_;
+  Trigger<> home_button_trigger_;       // GT911 capacitive "home" key below the screen -> on_home_button:
+  uint32_t last_home_btn_ms_{0};        // home-key debounce (coalesce a press's repeated reads)
   volatile uint32_t last_loop_ms_{0};   // stall-watchdog heartbeat
   volatile bool wdt_paused_{false};
   // charger/gauge

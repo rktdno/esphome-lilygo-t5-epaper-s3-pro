@@ -5,6 +5,19 @@ All notable changes to this component are documented here. This project adheres 
 
 ## [Unreleased]
 
+### Added
+- **`on_home_button:` trigger** — the round capacitive key below the screen is a GT911 **capacitive key**
+  (it sets status register `0x814E` bit4 / HaveKey with 0 touch points → `status == 0x90`; a normal tap is
+  bit7 + a touch count, never bit4). It is not a PCA9555 pin or GPIO0 — those were dead ends. Now exposed as
+  an automation trigger; `example.yaml` wires it to `deep_clean()` for a one-press hardware screen-clean.
+
+### Changed
+- **`deep_clean()` is now a real multi-flash de-ghost.** On the charger it flashes the panel full
+  black↔white three times through the GC16 waveform (via the diff engine — never `epd_clear()`), which
+  actually scrubs ghosting; the previous single white pass left visible residue. Off the charger it falls
+  back to a single light DU pass (repeated GC16 flashes would risk the rail-sag white-screen condition), so
+  dock on the charger for a full clean.
+
 ## [0.1.0] — first release
 
 The missing ESPHome component for the **LilyGO T5 E-Paper S3 Pro** (ED047TC1, 540×960,

@@ -182,3 +182,7 @@ display:
             else:
               - lambda: 'id(tap_count) += 1;'
               - component.update: epd
+    # The round capacitive "home" key below the screen -> de-ghost the panel (hardware clean button).
+    on_home_button:
+      then:
+        - lambda: 'id(epd).deep_clean();'

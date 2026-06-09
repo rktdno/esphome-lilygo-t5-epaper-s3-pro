@@ -16,8 +16,9 @@ talks to Home Assistant.
 |---|---|
 | **Display** | ED047TC1, 540×960 portrait (rotated), 16-level greyscale, driven via [epdiy](https://github.com/vroland/epdiy) |
 | **Touch** | GT911 capacitive, exposed as an `on_touch:` trigger with `x`/`y` in display coordinates |
+| **Home key** | The round capacitive button below the screen, exposed as an `on_home_button:` trigger |
 | **Battery** | SOC / voltage / charging state (BQ27220 gauge + BQ25896 charger), plus a software charge-voltage cap |
-| **Extras** | `deep_clean()` full-refresh API to clear e-paper ghosting |
+| **Extras** | `deep_clean()` multi-flash de-ghost to clear e-paper ghosting |
 
 ---
 
@@ -71,6 +72,7 @@ schema, so `update_interval`, `rotation` (handled internally — see below), `pa
 | `update_interval` | `60s` | E-paper is slow; don't go below a few seconds. |
 | `auto_clear_enabled` | set `false` | The component memsets the framebuffer white each frame; ESPHome's pixel-by-pixel auto-clear is redundant and slow here. |
 | `on_touch:` | — | Automation trigger with `int x` and `int y` (already in display coordinates, top-left origin). |
+| `on_home_button:` | — | Automation trigger (no args) for the round capacitive **home** key below the screen. Wire it to `id(epd).deep_clean();` for a hardware screen-clean, or anything else. |
 | `vcom` | `1560` | Panel VCOM in millivolts. The exact value is printed on your panel's flex cable; the default is sane for the S3 Pro's ED047TC1. |
 | `panel_rotation` | `inverted_portrait` | epdiy hardware rotation: `portrait` / `inverted_portrait` / `landscape` / `inverted_landscape`. Width/height are derived automatically. **Use this, not ESPHome's built-in `rotation:`** (that rotates in software on top). `inverted_portrait` puts the USB-C port at the bottom. |
 | `default_charge_cap` | `100` | Software charge-voltage cap (60–100%). 100 = charge to full; lower it for an always-powered install. Also settable at runtime via `set_charge_cap_pct()`. |
@@ -102,12 +104,20 @@ the readings to HA with `template` sensors (see `example.yaml`).
 
 E-paper accumulates faint ghosting from partial updates. The component does a deep flush **at boot**,
 resyncs the panel to a known-good full repaint **every 20th refresh**, and you can force a full
-de-ghost any time with `id(epd).deep_clean()` — handy on a physical button or an HA service call.
+de-ghost any time with `id(epd).deep_clean()` — handy on the **home button** (`on_home_button:`), an
+on-screen button, or an HA service call.
 
 `deep_clean()` is **diff-safe**: it renders the current view first and aborts if that came out blank
-(so it can never flash the panel white with nothing to put back), then de-ghosts in two passes
-*through epdiy's diff engine* rather than the low-level `epd_clear()`. That distinction is the whole
-ballgame on this board — see the white-screen note in the recipe below.
+(so it can never flash the panel white with nothing to put back), then de-ghosts *through epdiy's diff
+engine* rather than the low-level `epd_clear()`. On the charger it flashes the panel full **black↔white
+three times** through the GC16 waveform — that's what actually scrubs ghosting (~3s of visible flashing,
+like a Kindle full-refresh). Off the charger, repeated GC16 flashes risk the rail-sag white-screen
+condition, so it falls back to a single light DU pass (a resync, not a true de-ghost) — dock on the
+charger for a full clean. The "never `epd_clear()` at runtime" distinction is the whole ballgame on this
+board; see the white-screen note in the recipe below.
+
+The round capacitive **home key** below the screen is a GT911 capacitive key (not a separate GPIO) —
+the example wires `on_home_button:` to `deep_clean()` so it's a one-press hardware screen-clean.
 
 ---
 
@@ -168,6 +178,17 @@ If you're porting this board yourself, here's everything that was non-obvious:
     `MODE_DU` (you lose greyscale shading but the UI stays legible and the panel never strands); switch
     back to crisp GC16 when the rail is solid (on charger). Read on-charger live from the BQ25896
     (REG0B `PG_STAT`), and gate the push on the PCA9555 power-good bit (recipe step above).
+12. **The round "home" key below the screen is a GT911 capacitive key — not a GPIO.** A press shows up in
+    the GT911 status register (`0x814E`): bit7 (data-ready) **plus bit4 (HaveKey)**, with a touch count of
+    0 → `status == 0x90`. (A normal screen tap is bit7 + a non-zero touch count, never bit4.) So poll
+    `0x814E`, and if bit4 is set, treat it as the home button. The key-value register `0x8093` was useless
+    here (constant), so just key off the status bit. The component exposes this as the `on_home_button:`
+    trigger. (It is **not** wired to any PCA9555 pin or GPIO0 — those were dead ends.)
+13. **A real de-ghost needs multiple full GC16 flashes, not one white pass.** A single white-then-repaint
+    leaves visible residue. Flash the whole panel black↔white a few times — each inversion drives every
+    pixel through the greyscale waveform. Do it through `epd_hl_update_screen()` (solid frames via the diff
+    engine), never `epd_clear()` (recipe step 10), and only on the charger (the sustained current sags a
+    battery rail — recipe step 11).
 
 ---
 
