@@ -5,6 +5,11 @@ An [ESPHome](https://esphome.io) `display` component for the **LilyGO T5 E-Paper
 built in. Drop it into a config, write a `lambda:`, get a touch-driven e-paper panel that
 talks to Home Assistant.
 
+<p align="center">
+  <img src="t5.jpeg" alt="LilyGO T5 E-Paper S3 Pro running this component under ESPHome" width="300">
+  <br><em>The board running under ESPHome. The dashboard is just an example — you build your own.</em>
+</p>
+
 > **Why this exists:** every other ESPHome component for the LilyGO T5 4.7" targets the older
 > **Plus / V2.3** board. The **S3 Pro** is a different board (different power path, plus touch
 > and a battery charger) and people have been stuck getting it working under ESPHome — most
