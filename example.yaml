@@ -1,0 +1,184 @@
+# Minimal, self-contained example for the LilyGO T5 E-Paper S3 Pro.
+# Works standalone (no Home Assistant entities required): shows device status + battery,
+# counts taps, and has an on-screen "Clean screen" button that does a full e-paper refresh.
+#
+# Copy this, set your WiFi secrets, and `esphome run example.yaml`.
+substitutions:
+  name: t5-epaper
+  friendly_name: T5 E-Paper
+
+esphome:
+  name: ${name}
+  friendly_name: ${friendly_name}
+  name_add_mac_suffix: true
+  project:
+    name: rktdno.t5_epaper
+    version: "0.1.0"
+
+# Lets the ESPHome dashboard offer a one-click "Adopt" for any device running this firmware —
+# the generated config just references this file as a package + your WiFi secrets.
+dashboard_import:
+  package_import_url: github://rktdno/esphome-lilygo-t5-epaper-s3-pro/example.yaml@main
+
+esp32:
+  board: esp32-s3-devkitc-1
+  flash_size: 16MB
+  framework:
+    type: esp-idf
+
+# The T5 S3 Pro has 8MB octal PSRAM — required for the 540x960 framebuffer.
+psram:
+  mode: octal
+  speed: 80MHz
+
+logger:
+  hardware_uart: USB_SERIAL_JTAG
+  level: INFO
+
+wifi:
+  ssid: !secret wifi_ssid
+  password: !secret wifi_password
+
+api:
+ota:
+  - platform: esphome
+    on_begin:
+      - lambda: 'id(epd).pause_watchdog();'   # OTA blocks the loop legitimately — don't self-reboot mid-flash
+    on_error:
+      - lambda: 'id(epd).resume_watchdog();'
+
+external_components:
+  - source: github://rktdno/esphome-lilygo-t5-epaper-s3-pro
+    components: [t5_epaper]
+
+globals:
+  - id: tap_count
+    type: int
+    restore_value: false
+    initial_value: '0'
+
+sensor:
+  - platform: uptime
+    id: uptime_s
+  # Battery exposed to HA — values come from the BQ27220 gauge / BQ25896 charger read by the component.
+  - platform: template
+    name: "Battery"
+    device_class: battery
+    state_class: measurement
+    unit_of_measurement: "%"
+    accuracy_decimals: 0
+    entity_category: diagnostic
+    update_interval: 30s
+    lambda: 'int s = id(epd).battery_soc(); return s < 0 ? NAN : (float) s;'
+  - platform: template
+    name: "Battery voltage"
+    device_class: voltage
+    state_class: measurement
+    unit_of_measurement: "V"
+    accuracy_decimals: 2
+    entity_category: diagnostic
+    update_interval: 30s
+    lambda: 'float v = id(epd).battery_volts(); return v < 1.0f ? NAN : v;'
+
+binary_sensor:
+  - platform: template
+    name: "Charging"
+    device_class: battery_charging
+    entity_category: diagnostic
+    lambda: 'return id(epd).battery_charging();'
+
+# Optional: cap the charge voltage to preserve the LiPo when the panel lives on a charger.
+# Default is 100% (charge to full). Lower it (e.g. 80) for an always-powered install.
+number:
+  - platform: template
+    name: "Battery charge cap"
+    icon: "mdi:battery-heart-variant"
+    entity_category: config
+    mode: slider
+    optimistic: true
+    min_value: 60
+    max_value: 100
+    step: 5
+    initial_value: 100
+    unit_of_measurement: "%"
+    restore_value: true
+    set_action:
+      - lambda: 'id(epd).set_charge_cap_pct((int) x);'
+
+font:
+  - file: "gfonts://Roboto"
+    id: font_big
+    size: 54
+  - file: "gfonts://Roboto"
+    id: font_med
+    size: 32
+  - file: "gfonts://Roboto"
+    id: font_small
+    size: 24
+  - file: "https://github.com/Templarian/MaterialDesign-Webfont/raw/master/fonts/materialdesignicons-webfont.ttf"
+    id: font_icon
+    size: 40
+    glyphs:
+      - "\U000F05A9"  # wifi
+      - "\U000F05AA"  # wifi-off
+      - "\U000F0241"  # flash (charging)
+      - "\U000F00E2"  # broom (clean)
+
+display:
+  - platform: t5_epaper
+    id: epd
+    update_interval: 60s
+    auto_clear_enabled: false   # we memset the framebuffer white each frame ourselves
+    lambda: |-
+      const int W = it.get_width(), H = it.get_height();
+      bool wifi_ok = wifi::global_wifi_component != nullptr && wifi::global_wifi_component->is_connected();
+
+      // ---- header: wifi + battery % + charging bolt ----
+      it.printf(W - 20, 16, id(font_icon), TextAlign::TOP_RIGHT, wifi_ok ? "\U000F05A9" : "\U000F05AA");
+      if (id(epd).battery_soc() >= 0)
+        it.printf(W - 70, 20, id(font_small), TextAlign::TOP_RIGHT, "%d%%", id(epd).battery_soc());
+      if (id(epd).battery_charging())
+        it.printf(W - 130, 18, id(font_icon), TextAlign::TOP_RIGHT, "\U000F0241");
+      it.line(0, 70, W, 70);
+
+      // ---- title ----
+      it.printf(W / 2, 110, id(font_med), TextAlign::TOP_CENTER, "T5 E-Paper S3 Pro");
+
+      // ---- status rows ----
+      int y = 200;
+      it.printf(30, y, id(font_small), TextAlign::TOP_LEFT, "WiFi");
+      it.printf(W - 30, y, id(font_small), TextAlign::TOP_RIGHT, "%s", wifi_ok ? "connected" : "down");
+      y += 50;
+      it.printf(30, y, id(font_small), TextAlign::TOP_LEFT, "Uptime");
+      it.printf(W - 30, y, id(font_small), TextAlign::TOP_RIGHT, "%.0f min",
+                std::isnan(id(uptime_s).state) ? 0.0f : id(uptime_s).state / 60.0f);
+      y += 50;
+      it.printf(30, y, id(font_small), TextAlign::TOP_LEFT, "Battery");
+      if (id(epd).battery_soc() >= 0)
+        it.printf(W - 30, y, id(font_small), TextAlign::TOP_RIGHT, "%d%%  %.2fV%s", id(epd).battery_soc(),
+                  id(epd).battery_volts(), id(epd).battery_charging() ? "  chg" : "");
+      else
+        it.printf(W - 30, y, id(font_small), TextAlign::TOP_RIGHT, "--");
+      y += 50;
+      it.printf(30, y, id(font_small), TextAlign::TOP_LEFT, "Taps");
+      it.printf(W - 30, y, id(font_small), TextAlign::TOP_RIGHT, "%d", id(tap_count));
+
+      // ---- big tap counter ----
+      it.printf(W / 2, 470, id(font_big), TextAlign::TOP_CENTER, "Tap anywhere");
+
+      // ---- "Clean screen" button (rect 70,640 .. 470,740) ----
+      it.rectangle(70, 640, W - 140, 100);
+      it.printf(120, 666, id(font_icon), TextAlign::TOP_LEFT, "\U000F00E2");   // broom
+      it.printf(180, 672, id(font_med), TextAlign::TOP_LEFT, "Clean screen");
+
+    on_touch:
+      then:
+        - if:
+            condition:
+              # "Clean screen" button -> full e-paper refresh to clear ghosting
+              lambda: 'return x >= 70 && x <= 470 && y >= 640 && y <= 740;'
+            then:
+              - lambda: 'id(epd).deep_clean();'
+            else:
+              - lambda: 'id(tap_count) += 1;'
+              - component.update: epd
