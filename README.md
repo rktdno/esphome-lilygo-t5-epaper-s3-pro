@@ -44,6 +44,11 @@ external_components:
   - source: github://rktdno/esphome-lilygo-t5-epaper-s3-pro
     components: [t5_epaper]
 
+font:                          # any font the lambda prints with must be defined — ESPHome ships none
+  - file: "gfonts://Roboto"
+    id: my_font
+    size: 32
+
 display:
   - platform: t5_epaper
     id: epd

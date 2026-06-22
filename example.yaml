@@ -38,8 +38,23 @@ logger:
 wifi:
   ssid: !secret wifi_ssid
   password: !secret wifi_password
+  # This board is battery-capable. When it's legitimately off-network (out of WiFi range
+  # / a dead spot), the default 15min reboot_timeout just power-cycles every ~15min without
+  # recovering — and burns battery on each boot surge. Disable it: ESPHome keeps retrying
+  # WiFi in the background and the panel stays usable as a local display. The component's
+  # built-in 60s stall-watchdog still reboots genuine loop hangs, so self-healing is intact.
+  reboot_timeout: 0s
+  # Fallback hotspot: if WiFi can't connect, the panel brings up its own AP so you can join
+  # it from a phone and pick/enter a network (captive portal) — handy on first flash or if
+  # you move it to a different network. Change this AP password.
+  ap:
+    ssid: "T5 Panel Setup"
+    password: "configme1234"
+
+captive_portal:
 
 api:
+  reboot_timeout: 0s   # don't reboot just because HA's API client is unreachable
 ota:
   - platform: esphome
     on_begin:

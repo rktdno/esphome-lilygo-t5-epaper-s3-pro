@@ -12,11 +12,23 @@ All notable changes to this component are documented here. This project adheres 
   an automation trigger; `example.yaml` wires it to `deep_clean()` for a one-press hardware screen-clean.
 
 ### Changed
+- **`example.yaml` hardened for battery use.** Set `reboot_timeout: 0s` on `wifi:` and `api:` so an
+  off-network panel stops reboot-looping every ~15 min (the ESPHome default) — it keeps retrying WiFi
+  quietly and stays usable as a local display, instead of power-cycling and burning battery on each boot.
+  The built-in 60 s stall-watchdog still reboots genuine loop hangs. Also added an `ap:` + `captive_portal:`
+  fallback so you can join the panel's own hotspot from a phone to pick/enter WiFi on first flash or a
+  network change.
 - **`deep_clean()` is now a real multi-flash de-ghost.** On the charger it flashes the panel full
   black↔white three times through the GC16 waveform (via the diff engine — never `epd_clear()`), which
   actually scrubs ghosting; the previous single white pass left visible residue. Off the charger it falls
   back to a single light DU pass (repeated GC16 flashes would risk the rail-sag white-screen condition), so
   dock on the charger for a full clean.
+
+### Fixed
+- **README Quick Start now defines the `my_font` it prints with.** The minimal snippet's `lambda:` called
+  `id(my_font)` but never declared a `font:` block, so copying it verbatim failed config validation with
+  "Couldn't find ID 'my_font'" (ESPHome ships no default font). Added the missing `font:` definition.
+  Thanks to **euinor** for the report.
 
 ## [0.1.0] — first release
 
