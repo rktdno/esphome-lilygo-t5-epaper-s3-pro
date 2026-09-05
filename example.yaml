@@ -13,7 +13,7 @@ esphome:
   name_add_mac_suffix: true
   project:
     name: rktdno.t5_epaper
-    version: "0.1.0"
+    version: "0.2.0"
 
 # Lets the ESPHome dashboard offer a one-click "Adopt" for any device running this firmware —
 # the generated config just references this file as a package + your WiFi secrets.

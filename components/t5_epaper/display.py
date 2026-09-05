@@ -10,14 +10,12 @@ CONF_ON_HOME_BUTTON = "on_home_button"
 CONF_VCOM = "vcom"
 CONF_PANEL_ROTATION = "panel_rotation"
 CONF_DEFAULT_CHARGE_CAP = "default_charge_cap"
+CONF_HOME_BUTTON_DEBOUNCE = "home_button_debounce"
 
-# Pinned to a fork of vroland/epdiy at upstream commit bdb85cc (which carries the shared-I2C
-# init API — EpdInitConfig / EpdI2cConfig / epd_init_with_config — not yet in any release tag)
-# PLUS a one-commit fix: epd_board_v7's power-on busy-waited on PWRGOOD with no timeout and could
-# hang the device forever on a supply dip. PR'd upstream (vroland/epdiy); switch REPO/REF back to
-# vroland/epdiy once it merges.
+# Retains checked/bounded V7 power transitions (#481) and the upstream pointer-array
+# allocation fix (#488), on the shared-I2C / IDF 5.5-compatible baseline.
 EPDIY_REPO = "https://github.com/rktdno/epdiy"
-EPDIY_REF = "d92d739371957baebdb2031039abbbecc22ea841"
+EPDIY_REF = "09b8784b0d982be115928c7dc4a1734428f69e87"
 
 t5_epaper_ns = cg.esphome_ns.namespace("t5_epaper")
 T5Display = t5_epaper_ns.class_("T5Display", display.Display)
@@ -38,6 +36,7 @@ CONFIG_SCHEMA = display.FULL_DISPLAY_SCHEMA.extend(
         # The round "home" key below the screen (a GT911 capacitive key). Wire it to
         # e.g. lambda: 'id(epd).deep_clean();' for a hardware screen-clean button.
         cv.Optional(CONF_ON_HOME_BUTTON): automation.validate_automation(single=True),
+        cv.Optional(CONF_HOME_BUTTON_DEBOUNCE, default="1s"): cv.positive_time_period_milliseconds,
         # VCOM in millivolts (positive). The correct value is printed on your panel's flex
         # cable; 1560 is a sane default for the T5 S3 Pro's ED047TC1.
         cv.Optional(CONF_VCOM, default=1560): cv.int_range(min=1000, max=2500),
@@ -57,6 +56,7 @@ async def to_code(config):
     esp32.add_idf_component(name="epdiy", repo=EPDIY_REPO, ref=EPDIY_REF)
     var = cg.new_Pvariable(config[CONF_ID])
     await display.register_display(var, config)
+    cg.add(var.set_home_button_debounce(config[CONF_HOME_BUTTON_DEBOUNCE]))
     cg.add(var.set_vcom(config[CONF_VCOM]))
     cg.add(var.set_panel_rotation(cg.RawExpression(ROTATIONS[config[CONF_PANEL_ROTATION]])))
     cg.add(var.set_default_charge_cap(config[CONF_DEFAULT_CHARGE_CAP]))

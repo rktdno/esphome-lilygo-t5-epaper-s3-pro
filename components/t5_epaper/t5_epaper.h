@@ -58,7 +58,10 @@ class T5Display : public display::Display {
     i2c_master_bus_add_device(this->bus_, &dc, &this->bq_charger_);
     dc.device_address = 0x55;
     i2c_master_bus_add_device(this->bus_, &dc, &this->bq_gauge_);
-    this->apply_charge_cap_();   // enforce the cap (matters most when the panel lives on a charger)
+    // Apply the charge cap ONCE here (and again only when the HA slider changes). The cap logic is
+    // fine; the bug was calling it every 15s — that continuous rewrite fought the charge cycle. We
+    // disable the charger's I2C watchdog so the voltage cap holds with NO periodic writes.
+    this->apply_charge_cap_();
     this->refresh_battery_();
     // (GT911 touch added AFTER epd_init below — its latched address depends on epdiy's GPIO9/D8 setup)
     // 3) hand the bus to epdiy (it adds PCA9555/TPS on it, owns_bus=false)
@@ -67,17 +70,27 @@ class T5Display : public display::Display {
     static EpdInitConfig initcfg;
     initcfg.i2c = &i2ccfg;
     ESP_LOGI("t5_epaper", "epd_init_with_config (board v7, shared I2C)...");
-    epd_init_with_config(&epd_board_v7, &ED047TC1, EPD_LUT_64K, &initcfg);
+    // S3 LCD difference rendering uses the same vector path with a 1 KiB LUT.
+    // Avoid reserving an unused extra 63 KiB of scarce internal RAM.
+    epd_init_with_config(&epd_board_v7, &ED047TC1, EPD_LUT_1K, &initcfg);
     epd_set_vcom(this->vcom_);
     this->hl_ = epd_hl_init(EPD_BUILTIN_WAVEFORM);
     epd_set_rotation(this->rotation_);
-    // epd_width()/epd_height() are the panel's native (landscape) dims; swap them for portrait.
-    bool portrait = (this->rotation_ == EPD_ROT_PORTRAIT || this->rotation_ == EPD_ROT_INVERTED_PORTRAIT);
-    this->width_ = portrait ? epd_height() : epd_width();
-    this->height_ = portrait ? epd_width() : epd_height();
+    this->width_ = epd_rotated_display_width();
+    this->height_ = epd_rotated_display_height();
     this->fb_ = epd_hl_get_framebuffer(&this->hl_);
     this->fb_size_ = (size_t) epd_width() * epd_height() / 2;
-    this->clean_panel_();        // deep clean at boot so we start ghost-free
+    // Boot-only deep clean. A power failure must not block touch/HA startup or
+    // issue a waveform; the normal checked update will retry with a white pass.
+    if (epd_poweron_checked() == ESP_OK) {
+      epd_clear();
+      epd_clear();
+    } else {
+      ESP_LOGW("t5_epaper", "Boot clear deferred: display power-on failed");
+    }
+    if (epd_poweroff_checked() != ESP_OK)
+      ESP_LOGW("t5_epaper", "Boot display power-off failed");
+    epd_hl_set_all_white(&this->hl_);
 
     // our own read handle on the PCA9555 (0x20) to confirm EPD power-good before each push
     i2c_device_config_t pc = {};
@@ -106,76 +119,100 @@ class T5Display : public display::Display {
     }
     if (this->gt911_ == nullptr)
       ESP_LOGW("t5_epaper", "GT911 not found at 0x5D or 0x14");
-    // Self-heal: an independent task reboots us if the main loop ever stalls (a blocked EPD power
-    // op, a wedged I2C bus, etc.) so the panel recovers on its own instead of hanging. Paused
-    // during OTA (which legitimately blocks the loop) — wire ota: on_begin -> pause_watchdog().
+    // Self-heal: an independent task that reboots us if the main loop ever stalls (a blocked EPD
+    // power op, a wedged I2C bus, etc.) — so the panel recovers on its own instead of hanging
+    // until someone presses RST. Paused during OTA (which legitimately blocks the loop).
     this->last_loop_ms_ = millis();
     xTaskCreate(&T5Display::watchdog_task_, "t5_wdt", 2560, this, 1, nullptr);
   }
 
   void update() override {
-    // Don't power the e-paper on a sagging battery: if the supply dips, the TPS65185 may never
-    // reach power-good and epdiy's power-on busy-waits on it forever (epd_board_v7.c:231). Skip
-    // the refresh until the supply recovers (e.g. back on the charger). Always refresh while on
-    // external power (supply is solid even if % is low). The stall-watchdog covers anything else.
-    if (!this->on_charger_ && this->batt_mv_ > 0 && this->batt_mv_ < 3500) {
-      ESP_LOGW("t5_epaper", "battery %d mV + off charger - skipping EPD refresh (avoid power-up stall)",
-               this->batt_mv_);
+    if (this->is_failed() || this->fb_ == nullptr) return;
+    if (this->retry_pending_ && static_cast<int32_t>(millis() - this->retry_due_) < 0) return;
+    if (!this->on_charger_ && (this->batt_mv_ <= 0 || this->batt_mv_ < 3500)) {
+      ESP_LOGW("t5_epaper", "battery too low or unknown - deferring display update/clean");
       return;
     }
-    // Every 20th refresh, force a full-frame repaint to de-ghost + resync. We do this ONLY via
-    // epd_hl_set_all_white() (resets the diff back-buffer to white -> next push redraws everything;
-    // GC16's waveform de-ghosts on charger). We DELIBERATELY do NOT call the low-level epd_clear():
-    // epd_clear bypasses the diff engine, whitening the physical panel while epdiy still believes the
-    // old content is shown -> if the resync didn't take, the diff no-ops forever and the panel is STUCK
-    // WHITE (root cause of the recurring white-out). Driving the panel ONLY through epd_hl_update_screen
-    // keeps the diff and the physical panel in sync: a failed repaint degrades to STALE CONTENT, never blank.
-    this->refresh_count_++;
-    if (this->refresh_count_ % 20 == 0)
-      epd_hl_set_all_white(&this->hl_);
+    ++this->refresh_count_;
     std::memset(this->fb_, 0xFF, this->fb_size_);
     this->do_update_();
-    // Black-box recorder: if the render pipeline ever produces a fully-white framebuffer, pushing it
-    // would lock the screen white. Count it (exposed to HA) and skip the push so blank content can
-    // never overwrite good content on the panel.
     bool blank = true;
-    for (size_t i = 0; i < this->fb_size_; i++)
+    for (size_t i = 0; i < this->fb_size_; ++i)
       if (this->fb_[i] != 0xFF) { blank = false; break; }
     if (blank) {
-      this->blank_frame_count_++;
-      ESP_LOGW("t5_epaper", "do_update produced a BLANK frame (#%d, blank total=%u) - skipping push, keeping content",
-               this->refresh_count_, (unsigned) this->blank_frame_count_);
+      ++this->blank_frame_count_;
+      ESP_LOGW("t5_epaper", "BLANK render - preserving screen, update deferred");
       return;
     }
-    epd_poweron();
-    // Only push if the EPD rail actually reached power-good. Pushing while the rail is down would
-    // advance epdiy's diff back-buffer WITHOUT physically drawing -> the screen desyncs and then
-    // only pixels that later CHANGE get painted (the "blank except one toggling element" bug).
-    // Skipping keeps the diff in sync; the full frame repaints on the next good cycle (self-healing).
-    if (this->epd_powergood_()) {
-      // On battery a full GC16 refresh (16-level greyscale = many waveform frames = high sustained
-      // current) can sag the marginal rail mid-waveform: the draw doesn't complete, but epdiy still
-      // marks the back-buffer "drawn" -> diff desync -> stuck white. Use the light, fast, low-current
-      // MODE_DU off-charger; keep crisp GC16 while on external power (solid rail). DU is 1-bit B/W, so
-      // greyscale UIs lose shading off-charger but stay legible and never strand the panel.
-      enum EpdDrawMode mode = this->on_charger_ ? MODE_GC16 : MODE_DU;
-      enum EpdDrawError err = epd_hl_update_screen(&this->hl_, mode, 25);
-      if (err != EPD_DRAW_SUCCESS)
-        ESP_LOGW("t5_epaper", "update err=%d (mode=%s)", (int) err, mode == MODE_GC16 ? "GC16" : "DU");
-    } else {
-      this->pg_fail_count_++;
-      ESP_LOGW("t5_epaper", "EPD power-good NOT asserted (#%u) - skipped push to keep diff in sync",
-               (unsigned) this->pg_fail_count_);
+    const bool clean = this->clean_requested_ || !this->last_push_succeeded_ ||
+                       this->pushes_since_clean_ >= 19;
+    if (!clean && std::memcmp(this->fb_, this->hl_.back_fb, this->fb_size_) == 0) {
+      ++this->unchanged_frames_;
+      return;
     }
-    epd_poweroff();
+    const uint32_t started = millis();
+    const auto power_error = epd_poweron_checked();
+    if (power_error != ESP_OK || !this->epd_powergood_()) {
+      ESP_LOGW("t5_epaper", "Display power-on/readiness failed (%d)", (int) power_error);
+      ++this->pg_fail_count_;
+      if (epd_poweroff_checked() != ESP_OK)
+        ESP_LOGW("t5_epaper", "Display power cleanup failed");
+      this->draw_failed_();
+      return;
+    }
+    bool ok = true;
+    if (clean) {
+      // Establish white without relying on the old back buffer. Keep the
+      // validated content intact in front_fb throughout every cleaning pass.
+      ok = this->solid_pass_(0xF0, MODE_DU);
+      if (ok && this->deep_clean_requested_ && this->on_charger_) {
+        // Preserve the public deep_clean API: three black/white GC16 cycles
+        // on external power, with every pass checked and no extra framebuffer.
+        for (int i = 0; i < 3 && ok; ++i)
+          ok = this->solid_pass_(0x0F, MODE_GC16) && this->solid_pass_(0xF0, MODE_GC16);
+      }
+      if (ok) std::memset(this->hl_.back_fb, 0xFF, this->fb_size_);
+    }
+    if (ok) {
+      auto mode = this->on_charger_ ? MODE_GC16 : MODE_DU;
+      auto err = epd_hl_update_screen(&this->hl_, mode, 25);
+      ok = err == EPD_DRAW_SUCCESS && this->epd_powergood_();
+    }
+    // Always switch off, even after a failed draw. Do not mark the transaction
+    // successful when shutdown failed; invalidate diff state and retry later.
+    if (epd_poweroff_checked() != ESP_OK) {
+      ESP_LOGW("t5_epaper", "Display power-off failed");
+      ok = false;
+    }
+    if (!ok) {
+      this->draw_failed_();
+      return;
+    }
+    this->last_push_succeeded_ = true;
+    this->clean_requested_ = false;
+    this->deep_clean_requested_ = false;
+    this->retry_pending_ = false;
+    this->retry_attempts_ = 0;
+    if (clean) { ++this->clean_count_; this->pushes_since_clean_ = 0; }
+    else ++this->pushes_since_clean_;
+    ESP_LOGI("t5_epaper", "epd push ok (#%d, %s, %ums, pg_fail=%u)", this->refresh_count_,
+             clean ? "clean+content" : (this->on_charger_ ? "GC16" : "DU"),
+             (unsigned)(millis() - started), (unsigned)this->pg_fail_count_);
   }
 
   void loop() override {
     uint32_t now = millis();
     this->last_loop_ms_ = now;   // heartbeat for the stall watchdog
     if (now - this->last_batt_ > 15000) {   // refresh battery readings for HA + the low-batt guard
-      this->last_batt_ = now;               // (cap is applied once at setup / on change, NOT here:
-      this->refresh_battery_();             //  rewriting the charger every 15s makes charging cycle)
+      this->last_batt_ = now;               // (charge cap is applied once at boot, not here — the
+      this->refresh_battery_();             //  every-15s rewrite was what made charging cycle)
+    }
+    if (this->retry_pending_ && !this->wdt_paused_ &&
+        static_cast<int32_t>(now - this->retry_due_) >= 0) {
+      this->retry_pending_ = false;
+      this->update();
+      now = millis();
+      this->last_loop_ms_ = now;
     }
     if (this->gt911_ == nullptr || now - this->last_poll_ < 40)
       return;
@@ -186,14 +223,12 @@ class T5Display : public display::Display {
     bool touching = false;
     if (status & 0x80) {  // data ready (touch and/or capacitive key)
       uint8_t n = status & 0x0F;
-      // The round "home" button below the screen is a GT911 CAPACITIVE KEY: a press sets status bit4
-      // (HaveKey) with 0 touch points (status=0x90), distinct from a screen tap (bit7 + a touch count,
-      // never bit4). Fire the on_home_button: automation. Debounced — one press yields several reads and
-      // any wired action (e.g. deep_clean) is slow, so coalesce to one fire per second.
-      if ((status & 0x10) && (now - this->last_home_btn_ms_) >= 1000) {
+      // Home-key behaviour belongs to the consuming configuration. Preserve
+      // the public trigger and allow the kitchen to choose its lighter clean.
+      if ((status & 0x10) && (now - this->last_home_btn_ms_) >= this->home_button_debounce_ms_) {
         this->last_home_btn_ms_ = now;
-        ESP_LOGI("t5_epaper", "home button (GT911 key)");
         this->home_button_trigger_.trigger();
+        this->last_loop_ms_ = millis();
       }
       if (n >= 1 && n <= 5) {
         uint8_t pt[8];
@@ -209,7 +244,7 @@ class T5Display : public display::Display {
             if (now - this->last_action_ms_ >= 1000) {
               this->last_action_ms_ = now;
               ESP_LOGI("t5_epaper.touch", "TAP x=%d y=%d", x, y);
-              this->touch_trigger_.trigger(x, y);
+              if (this->transform_touch_(x, y)) this->touch_trigger_.trigger(x, y);
             } else {
               ESP_LOGD("t5_epaper.touch", "tap ignored (%ums since last action - settling)",
                        (unsigned) (now - this->last_action_ms_));
@@ -230,59 +265,31 @@ class T5Display : public display::Display {
   Trigger<int, int> *get_touch_trigger() { return &this->touch_trigger_; }
   Trigger<> *get_home_button_trigger() { return &this->home_button_trigger_; }
 
-  // De-ghost + full repaint. Wire to on_home_button:, an HA button/service, or a binary_sensor.
-  // E-paper ghosting only clears by flashing every pixel through the GC16 waveform, which the diff engine
-  // won't do on its own. Done SAFELY: (1) render the current view FIRST and ABORT if blank, so we never
-  // flash the panel with nothing to put back; (2) drive every flash THROUGH the diff engine (NEVER the
-  // low-level epd_clear() which desyncs the diff and strands the panel white). On charger: several full-
-  // screen black<->white GC16 flashes (the solid rail makes the sustained current safe) = a real de-ghost,
-  // ~3s of visible flashing, then repaint. Off charger a GC16 flash can sag the rail mid-waveform (the
-  // white-screen condition), so it falls back to a single light DU pass — that resyncs but can't truly
-  // de-ghost; dock on the charger for a proper clean.
+  // Configurable board settings retained from the public component.
+  void set_home_button_debounce(uint32_t ms) { this->home_button_debounce_ms_ = ms; }
+  void set_vcom(int mv) { this->vcom_ = mv; }
+  void set_panel_rotation(EpdRotation rotation) { this->rotation_ = rotation; }
+  void set_default_charge_cap(int pct) { this->charge_cap_pct_ = pct; }
+
+  // Stronger manual clean; low/unknown battery, blank renders and failed power
+  // still go through the same guards and bounded recovery as ordinary updates.
   void deep_clean() {
-    this->refresh_battery_();   // refresh charger state NOW so a clean right after docking picks the right path
-    this->fb_ = epd_hl_get_framebuffer(&this->hl_);
-    std::memset(this->fb_, 0xFF, this->fb_size_);
-    this->do_update_();
-    bool blank = true;
-    for (size_t i = 0; i < this->fb_size_; i++)
-      if (this->fb_[i] != 0xFF) { blank = false; break; }
-    if (blank) {
-      this->blank_frame_count_++;
-      ESP_LOGW("t5_epaper", "deep_clean aborted - render is blank, not flashing");
-      return;
-    }
-    // One full-screen powered push of a SOLID fill (0xFF white / 0x00 black) through the diff engine.
-    auto flash = [&](uint8_t fill, enum EpdDrawMode mode) {
-      this->fb_ = epd_hl_get_framebuffer(&this->hl_);
-      std::memset(this->fb_, fill, this->fb_size_);
-      epd_poweron();
-      if (this->epd_powergood_()) epd_hl_update_screen(&this->hl_, mode, 25);
-      epd_poweroff();
-      this->last_loop_ms_ = millis();   // each push ~0.4s; keep the stall-wdt fed across the sequence
-    };
-    if (this->on_charger_) {
-      for (int i = 0; i < 3; i++) { flash(0x00, MODE_GC16); flash(0xFF, MODE_GC16); }   // black<->white de-ghost
-    } else {
-      flash(0xFF, MODE_DU);                                                              // light resync only
-    }
-    // Redraw content: the flashes left the panel white, so diff(content vs white) = a full repaint.
-    enum EpdDrawMode mode = this->on_charger_ ? MODE_GC16 : MODE_DU;
-    this->fb_ = epd_hl_get_framebuffer(&this->hl_);
-    std::memset(this->fb_, 0xFF, this->fb_size_);
-    this->do_update_();
-    epd_poweron();
-    if (this->epd_powergood_()) epd_hl_update_screen(&this->hl_, mode, 25);
-    epd_poweroff();
-    this->last_loop_ms_ = millis();
-    ESP_LOGI("t5_epaper", "deep clean (%s)", this->on_charger_ ? "GC16 de-ghost x3" : "DU light, off charger");
+    this->deep_clean_requested_ = true;
+    this->clean_screen();
+  }
+
+  // Explicit clean is retained until a safe, successful white+content transaction.
+  void clean_screen() {
+    this->clean_requested_ = true;
+    this->refresh_battery_();
+    this->update();
   }
 
   // watchdog control — OTA legitimately blocks the loop, so pause around it
   void pause_watchdog() { this->wdt_paused_ = true; }
   void resume_watchdog() { this->wdt_paused_ = false; }
 
-  // battery / charge-cap API (for an HA number + a status screen)
+  // battery / charge-cap API (for the HA number + status screen)
   void set_charge_cap_pct(int pct) {
     this->charge_cap_pct_ = pct < 60 ? 60 : (pct > 100 ? 100 : pct);
     this->apply_charge_cap_();
@@ -297,37 +304,55 @@ class T5Display : public display::Display {
     if (mv > 4208) mv = 4208;
     return mv / 1000.0f;
   }
-  bool on_charger() { return this->on_charger_; }     // external power present (solid rail; drives the header bolt)
-  int blank_frames() { return (int) this->blank_frame_count_; }   // render-pipeline-produced-blank counter (for HA)
-
-  // config setters (called from to_code)
-  void set_vcom(int mv) { this->vcom_ = mv; }
-  void set_panel_rotation(EpdRotation r) { this->rotation_ = r; }
-  void set_default_charge_cap(int pct) { this->charge_cap_pct_ = pct; }
+  bool on_charger() { return this->on_charger_; }     // external power present (drives the header bolt)
+  int unchanged_frames() const { return (int)this->unchanged_frames_; }
+  int draw_failures() const { return (int)this->draw_failures_; }
+  int clean_count() const { return (int)this->clean_count_; }
+  int blank_frames() { return (int) this->blank_frame_count_; }   // render-pipeline-produced-blank counter
 
   int get_width_internal() override { return this->width_; }
   int get_height_internal() override { return this->height_; }
   display::DisplayType get_display_type() override { return display::DISPLAY_TYPE_GRAYSCALE; }
   void dump_config() override {
-    ESP_LOGCONFIG("t5_epaper", "LilyGO T5 E-Paper S3 Pro (540x960 grayscale, epdiy v7, GT911 touch)");
-    ESP_LOGCONFIG("t5_epaper", "  GT911 touch: %s", this->gt911_ ? "found" : "NOT found");
-    ESP_LOGCONFIG("t5_epaper", "  charge cap: %d%%", this->charge_cap_pct_);
+    ESP_LOGCONFIG("t5_epaper", "LilyGO T5 E-Paper S3 Pro (%dx%d, epdiy v7, GT911 touch)", this->width_, this->height_);
+    ESP_LOGCONFIG("t5_epaper", "  GT911: %s, charge cap: %d%%", this->gt911_ ? "found" : "not found", this->charge_cap_pct_);
   }
 
  protected:
-  // BOOT-ONLY deep flush. epd_clear() flashes the whole panel through the raw waveform (clears ghosting
-  // left by a previous firmware), then we sync the diff back-buffer to white to match. Safe ONLY at boot,
-  // before any content is on screen: epd_clear() bypasses the diff engine, so calling it at runtime would
-  // whiten the panel while epdiy still believes the old content is shown -> the diff no-ops -> stuck white.
-  // For a runtime de-ghost use deep_clean() (diff-safe). Do NOT call this from update() or a button.
-  void clean_panel_() {
-    epd_poweron();
-    epd_clear();
-    epd_clear();
-    epd_poweroff();
-    epd_hl_set_all_white(&this->hl_);
+  bool solid_pass_(uint8_t transition, EpdDrawMode mode) {
+    std::memset(this->hl_.difference_fb, transition, this->fb_size_ * 2);
+    auto err = epd_draw_base(epd_full_screen(), this->hl_.difference_fb, epd_full_screen(),
+        (EpdDrawMode)(mode | MODE_PACKING_1PPB_DIFFERENCE), 25, nullptr, nullptr, this->hl_.waveform);
+    this->last_loop_ms_ = millis();
+    return err == EPD_DRAW_SUCCESS && this->epd_powergood_();
   }
-
+  bool transform_touch_(int &x, int &y) const {
+    // GT911 coordinates match inverted portrait. Convert to the configured
+    // epdiy rotation, using the inverse of epdiy's framebuffer pixel transform.
+    const int native_w = epd_width(), native_h = epd_height();
+    if (x < 0 || x >= native_h || y < 0 || y >= native_w) return false;
+    const int tx = x, ty = y;
+    switch (this->rotation_) {
+      case EPD_ROT_LANDSCAPE: x = ty; y = native_h - 1 - tx; break;
+      case EPD_ROT_PORTRAIT: x = native_h - 1 - tx; y = native_w - 1 - ty; break;
+      case EPD_ROT_INVERTED_LANDSCAPE: x = native_w - 1 - ty; y = tx; break;
+      case EPD_ROT_INVERTED_PORTRAIT: break;
+    }
+    return true;
+  }
+  void draw_failed_() {
+    // epdiy may have advanced back_fb even on an error. Never reuse it as truth.
+    this->last_push_succeeded_ = false;
+    ++this->draw_failures_;
+    this->retry_pending_ = false;
+    if (this->retry_attempts_ < 3) {
+      ++this->retry_attempts_;
+      this->retry_pending_ = true;
+      this->retry_due_ = millis() + 5000;
+    }
+    ESP_LOGW("t5_epaper", "draw uncertain; recovery deferred (failures=%u, retries=%u)",
+             (unsigned)this->draw_failures_, (unsigned)this->retry_attempts_);
+  }
   bool gt911_read_(uint16_t reg, uint8_t *buf, size_t len) {
     uint8_t r[2] = {(uint8_t) (reg >> 8), (uint8_t) (reg & 0xFF)};
     return i2c_master_transmit_receive(this->gt911_, r, 2, buf, len, 50) == ESP_OK;
@@ -337,14 +362,13 @@ class T5Display : public display::Display {
     i2c_master_transmit(this->gt911_, w, 3, 50);
   }
 
-  // EPD power-good = PCA9555 port-1 bit6 (PC16). Fail-open (return true) if we can't read it,
-  // so an I2C hiccup never permanently blocks rendering.
+  // PCA9555 port-1 bit6 (PC16). Unknown power must prevent drawing; retries recover it.
   bool epd_powergood_() {
     if (this->pca_ == nullptr)
-      return true;
+      return false;
     uint8_t reg = 0x01, val = 0;   // PCA9555 input port 1
     if (i2c_master_transmit_receive(this->pca_, &reg, 1, &val, 1, 50) != ESP_OK)
-      return true;
+      return false;
     return (val & 0x40) != 0;
   }
 
@@ -417,11 +441,9 @@ class T5Display : public display::Display {
     }                                                                  // solid rail -> safe for crisp GC16
   }
 
-  // config (set from YAML; defaults match the T5 S3 Pro in portrait)
   int vcom_{1560};
   EpdRotation rotation_{EPD_ROT_INVERTED_PORTRAIT};
-  int width_{540};
-  int height_{960};
+  int width_{540}, height_{960};
 
   EpdiyHighlevelState hl_;
   uint8_t *fb_{nullptr};
@@ -429,21 +451,26 @@ class T5Display : public display::Display {
   i2c_master_bus_handle_t bus_{nullptr};
   i2c_master_dev_handle_t gt911_{nullptr};
   uint32_t last_poll_{0};
+  uint32_t last_action_ms_{0};   // tap-action debounce (stops rapid taps stacking refreshes + HA calls)
   bool was_touching_{false};
   int refresh_count_{0};
   Trigger<int, int> touch_trigger_;
-  Trigger<> home_button_trigger_;       // GT911 capacitive "home" key below the screen -> on_home_button:
-  uint32_t last_home_btn_ms_{0};        // home-key debounce (coalesce a press's repeated reads)
+  Trigger<> home_button_trigger_;
+  uint32_t last_home_btn_ms_{0}, home_button_debounce_ms_{1000};
   volatile uint32_t last_loop_ms_{0};   // stall-watchdog heartbeat
   volatile bool wdt_paused_{false};
   // charger/gauge
   i2c_master_dev_handle_t bq_charger_{nullptr};
   i2c_master_dev_handle_t bq_gauge_{nullptr};
   i2c_master_dev_handle_t pca_{nullptr};   // PCA9555 0x20, read PWRGOOD before each EPD push
+  bool last_push_succeeded_{false};
+  bool clean_requested_{false}, deep_clean_requested_{false}, retry_pending_{false};
+  uint32_t retry_due_{0}, retry_attempts_{0}, pushes_since_clean_{0};
+  uint32_t draw_failures_{0}, clean_count_{0};
+  uint32_t unchanged_frames_{0};
   uint32_t pg_fail_count_{0};
   uint32_t blank_frame_count_{0};   // times do_update() yielded an all-white frame (would lock the panel white)
-  int charge_cap_pct_{100};     // default: charge to full. Lower it (e.g. 80) for always-on/charger installs.
-  uint32_t last_action_ms_{0};  // tap-action debounce (stops rapid taps stacking refreshes + HA calls)
+  int charge_cap_pct_{100};     // Charge to full unless explicitly configured otherwise.
   int batt_soc_{-1};
   int batt_mv_{0};
   bool batt_charging_{false};   // actively charging (CHRG_STAT 1/2) — drives the charging-bolt glyph
